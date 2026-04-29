@@ -4,10 +4,12 @@ import urllib.parse
 import html
 import base64
 import binascii
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass
+import hashlib
+from typing import List, Dict, Any, Optional, Tuple, Set
+from dataclasses import dataclass, field
 from enum import Enum
 from urllib.parse import unquote, unquote_plus
+from collections import OrderedDict
 
 class SQLInjectionType(Enum):
     UNION_BASED = "UNION-Based"
@@ -23,10 +25,25 @@ class EncodingType(Enum):
     DOUBLE_URL_ENCODED = "Double URL-Encoded"
     TRIPLE_URL_ENCODED = "Triple URL-Encoded"
     HTML_ENTITY = "HTML Entity"
+    DOUBLE_HTML_ENTITY = "Double HTML Entity"
     UNICODE_ESCAPE = "Unicode Escape"
+    UNICODE_URL = "Unicode URL (%u)"
     HEX_ENCODED = "Hex Encoded"
+    HEX_STRING = "Hex String (0x)"
     BASE64_ENCODED = "Base64 Encoded"
-    UNICODE_URL_ENCODED = "Unicode URL-Encoded"
+    OCTAL_ENCODED = "Octal Encoded"
+    MIXED_ENCODING = "Mixed Encoding"
+    URL_PLUS_ENCODED = "URL+ Encoded (space as +)"
+    PERCENT_UPPER = "Percent Upper (%25)"
+    PERCENT_LOWER = "Percent Lower (%3d)"
+
+@dataclass
+class DecodeResult:
+    decoded_text: str
+    encoding_type: Optional[EncodingType]
+    decode_depth: int
+    decode_path: List[EncodingType] = field(default_factory=list)
+    original_text: str = ""
 
 @dataclass
 class SQLPayload:
@@ -38,6 +55,7 @@ class SQLPayload:
     original_encoded: str
     encoding_type: Optional[EncodingType] = None
     decode_depth: int = 0
+    decode_path: List[EncodingType] = field(default_factory=list)
 
 @dataclass 
 class VulnerabilityFinding:
@@ -51,187 +69,541 @@ class VulnerabilityFinding:
     response_raw: str
     timestamp: Optional[str] = None
 
-class EncodingDecoder:
-    def __init__(self, max_decode_depth: int = 5):
-        self.max_decode_depth = max_decode_depth
-        self.url_special_chars = set("'\"\\/;=()[]{}|+&%$#@!^*-")
-        
-    def decode_all(self, content: str) -> List[Tuple[str, EncodingType, int]]:
+class EncodingDetector:
+    URL_PATTERN = re.compile(r'%[0-9a-fA-F]{2}')
+    UNICODE_URL_PATTERN = re.compile(r'%u[0-9a-fA-F]{4}')
+    HEX_PATTERN = re.compile(r'\\x[0-9a-fA-F]{2}')
+    UNICODE_ESCAPE_PATTERN = re.compile(r'\\u[0-9a-fA-F]{4}')
+    OCTAL_PATTERN = re.compile(r'\\[0-7]{3}')
+    HTML_ENTITY_PATTERN = re.compile(r'&#[0-9]+;|&#x[0-9a-fA-F]+;|&[a-zA-Z]+;')
+    HEX_STRING_PATTERN = re.compile(r'0x[0-9a-fA-F]+')
+    BASE64_CHARS = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=')
+    URL_SAFE_BASE64_CHARS = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=')
+    
+    SQL_SPECIAL_CHARS = set("'\"\\/;=()[]{}|+&%$#@!^*-<>")
+    SQL_KEYWORDS = {'UNION', 'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 
+                    'LIKE', 'ORDER', 'GROUP', 'BY', 'HAVING', 'JOIN', 'LEFT', 
+                    'RIGHT', 'INNER', 'OUTER', 'FULL', 'ON', 'AS', 'DISTINCT',
+                    'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER',
+                    'TABLE', 'DATABASE', 'INDEX', 'VIEW', 'TRIGGER',
+                    'SLEEP', 'BENCHMARK', 'EXTRACTVALUE', 'UPDATEXML',
+                    'SUBSTRING', 'SUBSTR', 'ASCII', 'CHAR', 'ORD', 'MID',
+                    'LEFT', 'RIGHT', 'LENGTH', 'CHAR_LENGTH', 'INSTR', 'POSITION'}
+    
+    @classmethod
+    def detect_encoding(cls, text: str) -> List[Tuple[EncodingType, float]]:
         results = []
-        seen = set()
         
-        results.append((content, None, 0))
-        seen.add(content)
+        url_count = len(cls.URL_PATTERN.findall(text))
+        if url_count > 0:
+            url_ratio = url_count / max(1, len(text) / 3)
+            if '%25' in text or '%25' in text.upper():
+                double_count = text.upper().count('%25')
+                if double_count > url_count / 2:
+                    results.append((EncodingType.DOUBLE_URL_ENCODED, 0.9))
+                else:
+                    results.append((EncodingType.DOUBLE_URL_ENCODED, 0.6))
+                    results.append((EncodingType.URL_ENCODED, 0.8))
+            else:
+                results.append((EncodingType.URL_ENCODED, min(0.9, url_ratio + 0.3)))
         
-        current_layer = [content]
+        if '+' in text and ('%20' not in text):
+            words = text.split('+')
+            if len(words) > 1 and all(len(w) > 0 for w in words):
+                results.append((EncodingType.URL_PLUS_ENCODED, 0.7))
         
-        for depth in range(1, self.max_decode_depth + 1):
-            next_layer = []
+        unicode_url_count = len(cls.UNICODE_URL_PATTERN.findall(text))
+        if unicode_url_count > 0:
+            results.append((EncodingType.UNICODE_URL, 0.9))
+        
+        hex_escape_count = len(cls.HEX_PATTERN.findall(text))
+        if hex_escape_count > 0:
+            results.append((EncodingType.HEX_ENCODED, 0.85))
+        
+        unicode_escape_count = len(cls.UNICODE_ESCAPE_PATTERN.findall(text))
+        if unicode_escape_count > 0:
+            results.append((EncodingType.UNICODE_ESCAPE, 0.9))
+        
+        octal_count = len(cls.OCTAL_PATTERN.findall(text))
+        if octal_count > 0:
+            results.append((EncodingType.OCTAL_ENCODED, 0.85))
+        
+        html_entity_count = len(cls.HTML_ENTITY_PATTERN.findall(text))
+        if html_entity_count > 0:
+            if '&amp;' in text:
+                results.append((EncodingType.DOUBLE_HTML_ENTITY, 0.8))
+            results.append((EncodingType.HTML_ENTITY, 0.85))
+        
+        hex_string_match = cls.HEX_STRING_PATTERN.search(text)
+        if hex_string_match:
+            results.append((EncodingType.HEX_STRING, 0.8))
+        
+        base64_score = cls._score_base64(text)
+        if base64_score > 0.6:
+            results.append((EncodingType.BASE64_ENCODED, base64_score))
+        
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+    
+    @classmethod
+    def _score_base64(cls, text: str) -> float:
+        if len(text) < 8:
+            return 0.0
+        
+        stripped = text.strip()
+        
+        valid_chars = all(c in cls.BASE64_CHARS for c in stripped)
+        valid_url_safe = all(c in cls.URL_SAFE_BASE64_CHARS for c in stripped)
+        
+        if not (valid_chars or valid_url_safe):
+            return 0.0
+        
+        if len(stripped) % 4 != 0:
+            return 0.3
+        
+        equals_count = stripped.count('=')
+        if equals_count > 2:
+            return 0.3
+        
+        if equals_count > 0 and not stripped.endswith('='):
+            return 0.4
+        
+        upper_ratio = sum(1 for c in stripped if c.isupper()) / max(1, len(stripped) - equals_count)
+        lower_ratio = sum(1 for c in stripped if c.islower()) / max(1, len(stripped) - equals_count)
+        
+        if 0.2 < upper_ratio < 0.8 and 0.2 < lower_ratio < 0.8:
+            return 0.85
+        
+        return 0.6
+    
+    @classmethod
+    def has_sql_indicators(cls, text: str) -> bool:
+        text_upper = text.upper()
+        
+        for char in cls.SQL_SPECIAL_CHARS:
+            if char in text:
+                return True
+        
+        for keyword in cls.SQL_KEYWORDS:
+            if f' {keyword} ' in text_upper or f'{keyword}(' in text_upper:
+                return True
+        
+        return False
+    
+    @classmethod
+    def calculate_decode_necessity(cls, text: str) -> float:
+        score = 0.0
+        
+        if cls.has_sql_indicators(text):
+            score += 0.3
+        
+        if '%' in text:
+            url_count = len(cls.URL_PATTERN.findall(text))
+            score += min(0.4, url_count * 0.05)
+        
+        if '&#' in text or '&' in text:
+            html_count = len(cls.HTML_ENTITY_PATTERN.findall(text))
+            score += min(0.4, html_count * 0.05)
+        
+        if '\\x' in text or '\\u' in text:
+            score += 0.3
+        
+        if '+' in text and len(text.split('+')) > 2:
+            score += 0.2
+        
+        return min(1.0, score)
+
+class AdvancedDecoder:
+    MAX_DECODE_DEPTH = 8
+    MAX_DECODE_ATTEMPTS = 50
+    
+    def __init__(self):
+        self.decoded_cache: Dict[str, List[DecodeResult]] = {}
+        self.seen_texts: Set[str] = set()
+    
+    def decode_all(self, text: str) -> List[DecodeResult]:
+        if not text:
+            return []
+        
+        if text in self.decoded_cache:
+            return self.decoded_cache[text]
+        
+        self.seen_texts.clear()
+        results = []
+        
+        results.append(DecodeResult(
+            decoded_text=text,
+            encoding_type=None,
+            decode_depth=0,
+            decode_path=[],
+            original_text=text
+        ))
+        self.seen_texts.add(text)
+        
+        self._recursive_decode(
+            text, 
+            [], 
+            0, 
+            results
+        )
+        
+        results = self._deduplicate_results(results)
+        
+        self.decoded_cache[text] = results
+        return results
+    
+    def _recursive_decode(
+        self, 
+        text: str, 
+        current_path: List[EncodingType], 
+        current_depth: int,
+        results: List[DecodeResult]
+    ):
+        if current_depth >= self.MAX_DECODE_DEPTH:
+            return
+        
+        if len(results) > self.MAX_DECODE_ATTEMPTS:
+            return
+        
+        detected = EncodingDetector.detect_encoding(text)
+        
+        for encoding_type, confidence in detected:
+            if confidence < 0.3:
+                continue
             
-            for text in current_layer:
-                decoded_list = self._decode_single_layer(text)
+            decoded = self._decode_by_type(text, encoding_type)
+            
+            if decoded and decoded != text and decoded not in self.seen_texts:
+                self.seen_texts.add(decoded)
                 
-                for decoded, encoding_type in decoded_list:
-                    if decoded and decoded not in seen and decoded != text:
-                        seen.add(decoded)
-                        results.append((decoded, encoding_type, depth))
-                        next_layer.append(decoded)
-            
-            if not next_layer:
-                break
-            
-            current_layer = next_layer
+                new_path = current_path + [encoding_type]
+                
+                result = DecodeResult(
+                    decoded_text=decoded,
+                    encoding_type=encoding_type,
+                    decode_depth=current_depth + 1,
+                    decode_path=new_path.copy(),
+                    original_text=text
+                )
+                results.append(result)
+                
+                if EncodingDetector.calculate_decode_necessity(decoded) > 0.2:
+                    self._recursive_decode(
+                        decoded, 
+                        new_path, 
+                        current_depth + 1, 
+                        results
+                    )
         
-        return results
+        if '%' in text or '+' in text:
+            decoded = self._url_decode_full(text)
+            if decoded and decoded != text and decoded not in self.seen_texts:
+                self.seen_texts.add(decoded)
+                
+                encoding = EncodingType.URL_ENCODED if '%' in text else EncodingType.URL_PLUS_ENCODED
+                new_path = current_path + [encoding]
+                
+                result = DecodeResult(
+                    decoded_text=decoded,
+                    encoding_type=encoding,
+                    decode_depth=current_depth + 1,
+                    decode_path=new_path.copy(),
+                    original_text=text
+                )
+                results.append(result)
+                
+                if EncodingDetector.calculate_decode_necessity(decoded) > 0.2:
+                    self._recursive_decode(
+                        decoded, 
+                        new_path, 
+                        current_depth + 1, 
+                        results
+                    )
     
-    def _decode_single_layer(self, text: str) -> List[Tuple[str, EncodingType]]:
-        results = []
-        
-        url_decoded = self._url_decode(text)
-        if url_decoded and url_decoded != text:
-            results.append((url_decoded, EncodingType.URL_ENCODED))
-        
-        double_decoded = self._double_url_decode(text)
-        if double_decoded and double_decoded != text and double_decoded != url_decoded:
-            results.append((double_decoded, EncodingType.DOUBLE_URL_ENCODED))
-        
-        html_decoded = self._html_entity_decode(text)
-        if html_decoded and html_decoded != text:
-            results.append((html_decoded, EncodingType.HTML_ENTITY))
-        
-        unicode_decoded = self._unicode_escape_decode(text)
-        if unicode_decoded and unicode_decoded != text:
-            results.append((unicode_decoded, EncodingType.UNICODE_ESCAPE))
-        
-        hex_decoded = self._hex_decode(text)
-        if hex_decoded and hex_decoded != text:
-            results.append((hex_decoded, EncodingType.HEX_ENCODED))
-        
-        base64_decoded = self._base64_decode(text)
-        if base64_decoded and base64_decoded != text:
-            results.append((base64_decoded, EncodingType.BASE64_ENCODED))
-        
-        unicode_url_decoded = self._unicode_url_decode(text)
-        if unicode_url_decoded and unicode_url_decoded != text:
-            results.append((unicode_url_decoded, EncodingType.UNICODE_URL_ENCODED))
-        
-        return results
-    
-    def _url_decode(self, text: str) -> Optional[str]:
+    def _decode_by_type(self, text: str, encoding_type: EncodingType) -> Optional[str]:
         try:
-            decoded = unquote_plus(text)
-            if decoded != text:
-                return decoded
-            decoded = unquote(text)
-            if decoded != text:
-                return decoded
-        except (ValueError, TypeError):
-            pass
-        return None
-    
-    def _double_url_decode(self, text: str) -> Optional[str]:
-        try:
-            first_decode = unquote(text)
-            if first_decode == text:
+            if encoding_type == EncodingType.URL_ENCODED:
+                return self._url_decode_full(text)
+            
+            elif encoding_type == EncodingType.URL_PLUS_ENCODED:
+                return unquote_plus(text)
+            
+            elif encoding_type == EncodingType.DOUBLE_URL_ENCODED:
+                first = unquote(text)
+                if first != text:
+                    second = unquote(first)
+                    return second
                 return None
-            second_decode = unquote(first_decode)
-            if second_decode != first_decode:
-                return second_decode
-        except (ValueError, TypeError):
-            pass
-        return None
+            
+            elif encoding_type == EncodingType.TRIPLE_URL_ENCODED:
+                result = text
+                for _ in range(3):
+                    decoded = unquote(result)
+                    if decoded == result:
+                        break
+                    result = decoded
+                return result if result != text else None
+            
+            elif encoding_type == EncodingType.HTML_ENTITY:
+                return html.unescape(text)
+            
+            elif encoding_type == EncodingType.DOUBLE_HTML_ENTITY:
+                first = html.unescape(text)
+                if first != text:
+                    second = html.unescape(first)
+                    return second
+                return None
+            
+            elif encoding_type == EncodingType.UNICODE_ESCAPE:
+                return self._unicode_escape_decode(text)
+            
+            elif encoding_type == EncodingType.UNICODE_URL:
+                return self._unicode_url_decode(text)
+            
+            elif encoding_type == EncodingType.HEX_ENCODED:
+                return self._hex_escape_decode(text)
+            
+            elif encoding_type == EncodingType.HEX_STRING:
+                return self._hex_string_decode(text)
+            
+            elif encoding_type == EncodingType.BASE64_ENCODED:
+                return self._base64_decode_full(text)
+            
+            elif encoding_type == EncodingType.OCTAL_ENCODED:
+                return self._octal_decode(text)
+            
+            elif encoding_type == EncodingType.MIXED_ENCODING:
+                return self._mixed_decode(text)
+            
+            return None
+            
+        except Exception:
+            return None
     
-    def _html_entity_decode(self, text: str) -> Optional[str]:
-        try:
-            decoded = html.unescape(text)
-            if decoded != text:
-                return decoded
-        except (ValueError, TypeError):
-            pass
-        return None
+    def _url_decode_full(self, text: str) -> str:
+        result = text
+        changed = True
+        iterations = 0
+        
+        while changed and iterations < 10:
+            iterations += 1
+            new_result = unquote(result)
+            if new_result == result:
+                new_result = unquote_plus(result)
+            if new_result == result:
+                changed = False
+            else:
+                result = new_result
+        
+        return result
     
     def _unicode_escape_decode(self, text: str) -> Optional[str]:
         try:
-            if '\\u' in text or '\\U' in text or '\\x' in text:
-                decoded = text.encode('latin1').decode('unicode_escape')
-                if decoded != text:
-                    return decoded
-        except (ValueError, TypeError, UnicodeDecodeError, UnicodeEncodeError):
-            pass
-        return None
+            if '\\u' not in text and '\\x' not in text and '\\U' not in text:
+                return None
+            
+            result = text
+            
+            result = re.sub(
+                r'\\u([0-9a-fA-F]{4})',
+                lambda m: chr(int(m.group(1), 16)),
+                result
+            )
+            
+            result = re.sub(
+                r'\\x([0-9a-fA-F]{2})',
+                lambda m: chr(int(m.group(1), 16)),
+                result
+            )
+            
+            result = re.sub(
+                r'\\U([0-9a-fA-F]{8})',
+                lambda m: chr(int(m.group(1), 16)),
+                result
+            )
+            
+            return result if result != text else None
+            
+        except Exception:
+            return None
     
-    def _hex_decode(self, text: str) -> Optional[str]:
-        hex_patterns = [
-            (r'\b0x([0-9a-fA-F]+)\b', 1),
-            (r'\b([0-9a-fA-F]{8,})\b', 0),
-        ]
-        
-        for pattern, group in hex_patterns:
-            matches = re.finditer(pattern, text)
-            for match in matches:
-                hex_str = match.group(group) if group else match.group(0)
+    def _unicode_url_decode(self, text: str) -> Optional[str]:
+        try:
+            if '%u' not in text and '%U' not in text:
+                return None
+            
+            result = re.sub(
+                r'%u([0-9a-fA-F]{4})',
+                lambda m: chr(int(m.group(1), 16)),
+                text,
+                flags=re.IGNORECASE
+            )
+            
+            return result if result != text else None
+            
+        except Exception:
+            return None
+    
+    def _hex_escape_decode(self, text: str) -> Optional[str]:
+        try:
+            if '\\x' not in text and '\\X' not in text:
+                return None
+            
+            result = re.sub(
+                r'\\x([0-9a-fA-F]{2})',
+                lambda m: chr(int(m.group(1), 16)),
+                text,
+                flags=re.IGNORECASE
+            )
+            
+            return result if result != text else None
+            
+        except Exception:
+            return None
+    
+    def _hex_string_decode(self, text: str) -> Optional[str]:
+        try:
+            matches = re.findall(r'0x([0-9a-fA-F]+)', text, re.IGNORECASE)
+            if not matches:
+                return None
+            
+            result = text
+            for hex_str in matches:
                 if len(hex_str) % 2 == 0:
                     try:
                         decoded = bytes.fromhex(hex_str).decode('utf-8', errors='replace')
-                        if decoded and any(c in self.url_special_chars for c in decoded):
-                            return decoded
-                    except (ValueError, TypeError, binascii.Error):
+                        result = result.replace(f'0x{hex_str}', decoded)
+                        result = result.replace(f'0X{hex_str}', decoded)
+                    except Exception:
                         pass
-        return None
+            
+            return result if result != text else None
+            
+        except Exception:
+            return None
     
-    def _base64_decode(self, text: str) -> Optional[str]:
-        base64_pattern = r'^[A-Za-z0-9+/=]{8,}$|^[A-Za-z0-9_-]{8,}$'
-        
-        if re.match(base64_pattern, text.strip()):
+    def _base64_decode_full(self, text: str) -> Optional[str]:
+        try:
+            stripped = text.strip()
+            
+            padding_needed = 4 - (len(stripped) % 4)
+            if padding_needed != 4:
+                stripped += '=' * padding_needed
+            
             try:
-                decoded = base64.b64decode(text.strip(), validate=True)
-                decoded_str = decoded.decode('utf-8', errors='replace')
-                if decoded_str and any(c in self.url_special_chars for c in decoded_str):
-                    return decoded_str
-            except (base64.binascii.Error, ValueError, UnicodeDecodeError):
-                pass
-        
-        parts = re.findall(r'[A-Za-z0-9+/=]{16,}', text)
-        for part in parts:
+                decoded = base64.b64decode(stripped, validate=True)
+            except Exception:
+                try:
+                    decoded = base64.b64decode(stripped.replace('-', '+').replace('_', '/'), validate=True)
+                except Exception:
+                    decoded = base64.b64decode(stripped, validate=False)
+            
             try:
-                decoded = base64.b64decode(part, validate=True)
-                decoded_str = decoded.decode('utf-8', errors='replace')
-                if decoded_str and any(c in self.url_special_chars for c in decoded_str):
-                    return decoded_str
-            except (base64.binascii.Error, ValueError, UnicodeDecodeError):
-                pass
-        
-        return None
+                result = decoded.decode('utf-8')
+            except UnicodeDecodeError:
+                result = decoded.decode('latin1')
+            
+            if EncodingDetector.has_sql_indicators(result):
+                return result
+            
+            if len(result) > 0 and all(32 <= ord(c) < 127 for c in result):
+                return result
+            
+            return None
+            
+        except Exception:
+            return None
     
-    def _unicode_url_decode(self, text: str) -> Optional[str]:
-        unicode_url_pattern = r'%u([0-9a-fA-F]{4})'
+    def _octal_decode(self, text: str) -> Optional[str]:
+        try:
+            if '\\' not in text:
+                return None
+            
+            result = re.sub(
+                r'\\([0-7]{3})',
+                lambda m: chr(int(m.group(1), 8)),
+                text
+            )
+            
+            return result if result != text else None
+            
+        except Exception:
+            return None
+    
+    def _mixed_decode(self, text: str) -> Optional[str]:
+        try:
+            result = text
+            
+            result = html.unescape(result)
+            
+            result = unquote_plus(result)
+            
+            result = re.sub(
+                r'%u([0-9a-fA-F]{4})',
+                lambda m: chr(int(m.group(1), 16)),
+                result,
+                flags=re.IGNORECASE
+            )
+            
+            result = re.sub(
+                r'\\x([0-9a-fA-F]{2})',
+                lambda m: chr(int(m.group(1), 16)),
+                result,
+                flags=re.IGNORECASE
+            )
+            
+            result = re.sub(
+                r'\\u([0-9a-fA-F]{4})',
+                lambda m: chr(int(m.group(1), 16)),
+                result
+            )
+            
+            return result if result != text else None
+            
+        except Exception:
+            return None
+    
+    def _deduplicate_results(self, results: List[DecodeResult]) -> List[DecodeResult]:
+        seen = {}
         
-        matches = re.findall(unicode_url_pattern, text)
-        if matches:
-            try:
-                result = text
-                for match in matches:
-                    char_code = int(match, 16)
-                    result = result.replace(f'%u{match}', chr(char_code))
-                if result != text:
-                    return result
-            except (ValueError, TypeError):
-                pass
-        return None
+        for result in results:
+            key = result.decoded_text
+            
+            if key not in seen:
+                seen[key] = result
+            else:
+                existing = seen[key]
+                
+                if len(result.decode_path) > len(existing.decode_path):
+                    seen[key] = result
+                elif len(result.decode_path) == len(existing.decode_path):
+                    if result.decode_depth < existing.decode_depth:
+                        seen[key] = result
+        
+        final_results = list(seen.values())
+        
+        final_results.sort(key=lambda x: (
+            -len(x.decode_path),
+            x.decode_depth,
+            -EncodingDetector.calculate_decode_necessity(x.decoded_text)
+        ))
+        
+        return final_results
 
 class SQLInjectionDetector:
-    def __init__(self, enable_encoding_detection: bool = True, max_decode_depth: int = 5):
+    def __init__(self, enable_encoding_detection: bool = True, max_decode_depth: int = 8):
         self.enable_encoding_detection = enable_encoding_detection
-        self.decoder = EncodingDecoder(max_decode_depth=max_decode_depth)
+        self.decoder = AdvancedDecoder()
         self.patterns = self._init_patterns()
 
     def _init_patterns(self) -> Dict[SQLInjectionType, List[str]]:
         return {
             SQLInjectionType.UNION_BASED: [
-                r'\bUNION\s+(?:ALL\s+)?SELECT\b',
+                r'\bUNION\s+(?:ALL\s+)?(?:DISTINCT\s+)?SELECT\b',
                 r'\bUNION\s+SELECT\b',
-                r'\bSELECT\s+.*\s+FROM\b',
+                r'\bSELECT\s+.*?\s+FROM\b',
                 r'\bUNION\s+DISTINCT\s+SELECT\b',
+                r'\bUNION\s+ALL\s+SELECT\b',
             ],
             SQLInjectionType.ERROR_BASED: [
                 r'\bAND\s+EXTRACTVALUE\s*\(',
@@ -248,10 +620,11 @@ class SQLInjectionDetector:
                 r'\bUnclosed\s+quotation',
                 r'\bInvalid\s+column\s+name',
                 r'\bConversion\s+failed',
+                r'\bYou\s+have\s+an\s+error\s+in\s+your\s+SQL\s+syntax',
             ],
             SQLInjectionType.BOOLEAN_BASED: [
-                r'\bAND\s+\d+\s*=\s*\d+',
-                r'\bOR\s+\d+\s*=\s*\d+',
+                r'\bAND\s+\d+\s*=\s*\d+\b',
+                r'\bOR\s+\d+\s*=\s*\d+\b',
                 r'\bAND\s+TRUE\b',
                 r'\bAND\s+FALSE\b',
                 r'\bOR\s+TRUE\b',
@@ -260,8 +633,10 @@ class SQLInjectionDetector:
                 r'\bAND\s+1\s*=\s*2\b',
                 r'\bOR\s+1\s*=\s*1\b',
                 r'\bOR\s+1\s*=\s*2\b',
-                r'\bAND\s+\'[^\']*\'\s*=\s*\'',
-                r'\bOR\s+\'[^\']*\'\s*=\s*\'',
+                r"\bAND\s+'[^']*'\s*=\s*'",
+                r"\bOR\s+'[^']*'\s*=\s*'",
+                r'\bAND\s+"[^"]*"\s*=\s*"',
+                r'\bOR\s+"[^"]*"\s*=\s*"',
             ],
             SQLInjectionType.TIME_BASED: [
                 r'\bSLEEP\s*\(\s*\d+\s*\)',
@@ -275,6 +650,8 @@ class SQLInjectionDetector:
                 r'\bOR\s+sleep\s*\(',
                 r'\bIF\s*\(.*SLEEP',
                 r'\bCASE\s+WHEN.*SLEEP',
+                r'\bWAITFOR\s+TIME',
+                r'\bDELAY\s*\(',
             ],
             SQLInjectionType.COMMENT: [
                 r'--.*$',
@@ -283,11 +660,15 @@ class SQLInjectionDetector:
                 r';\s*--',
                 r';\s*#',
                 r'\s+--\s*$',
+                r'--\s*$',
+                r'#\s*$',
             ],
             SQLInjectionType.STACKED_QUERIES: [
-                r';\s*(?:INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|EXEC)\b',
-                r';\s*(?:insert|update|delete|drop|create|alter|truncate|exec)\b',
+                r';\s*(?:INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|EXEC|GRANT|REVOKE)\b',
+                r';\s*(?:insert|update|delete|drop|create|alter|truncate|exec|grant|revoke)\b',
                 r';\s*(?:SELECT|INSERT|UPDATE|DELETE)\s+',
+                r';\s*SHUTDOWN\b',
+                r';\s*BACKUP\s+DATABASE\b',
             ],
             SQLInjectionType.BLIND: [
                 r'\bLIKE\s+[\'"]%',
@@ -303,26 +684,39 @@ class SQLInjectionDetector:
                 r'\bCHAR_LENGTH\s*\(',
                 r'\bINSTR\s*\(',
                 r'\bPOSITION\s*\(',
+                r'\bLOCATE\s*\(',
+                r'\bSTRCMP\s*\(',
+                r'\bstrcmp\s*\(',
             ],
         }
 
     def detect(self, content: str, location: str = "unknown") -> List[SQLPayload]:
         payloads = []
         
+        if not content or len(content) < 3:
+            return payloads
+        
         if self.enable_encoding_detection:
-            decoded_variants = self.decoder.decode_all(content)
+            decode_necessity = EncodingDetector.calculate_decode_necessity(content)
             
-            for decoded_text, encoding_type, decode_depth in decoded_variants:
-                found = self._detect_in_content(
-                    decoded_text, 
-                    location, 
-                    content, 
-                    encoding_type, 
-                    decode_depth
-                )
+            if decode_necessity > 0.1:
+                decoded_variants = self.decoder.decode_all(content)
+                
+                for decoded_result in decoded_variants:
+                    found = self._detect_in_content(
+                        decoded_result.decoded_text, 
+                        location, 
+                        content,
+                        decoded_result.encoding_type,
+                        decoded_result.decode_depth,
+                        decoded_result.decode_path
+                    )
+                    payloads.extend(found)
+            else:
+                found = self._detect_in_content(content, location, content, None, 0, [])
                 payloads.extend(found)
         else:
-            found = self._detect_in_content(content, location, content, None, 0)
+            found = self._detect_in_content(content, location, content, None, 0, [])
             payloads.extend(found)
         
         return self._deduplicate_payloads(payloads)
@@ -333,7 +727,8 @@ class SQLInjectionDetector:
         location: str,
         original_content: str,
         encoding_type: Optional[EncodingType],
-        decode_depth: int
+        decode_depth: int,
+        decode_path: List[EncodingType]
     ) -> List[SQLPayload]:
         payloads = []
         
@@ -345,12 +740,17 @@ class SQLInjectionDetector:
                         injection_type, 
                         match.group(),
                         encoding_type,
-                        decode_depth
+                        decode_depth,
+                        decode_path
                     )
                     
                     start = max(0, match.start() - 50)
                     end = min(len(content), match.end() + 50)
-                    context = content[start:end].replace('\n', ' ').strip()
+                    context = content[start:end].replace('\n', ' ').replace('\r', ' ').strip()
+                    
+                    orig_start = max(0, match.start() - 30)
+                    orig_end = min(len(original_content), match.end() + 30)
+                    original_encoded = original_content[orig_start:orig_end] if original_content != content else match.group()
                     
                     payload = SQLPayload(
                         payload=match.group(),
@@ -358,11 +758,10 @@ class SQLInjectionDetector:
                         location=location,
                         confidence=confidence,
                         context=context,
-                        original_encoded=original_content[
-                            max(0, match.start() - 30):min(len(original_content), match.end() + 30)
-                        ] if original_content != content else match.group(),
+                        original_encoded=original_encoded,
                         encoding_type=encoding_type,
-                        decode_depth=decode_depth
+                        decode_depth=decode_depth,
+                        decode_path=decode_path.copy() if decode_path else []
                     )
                     payloads.append(payload)
         
@@ -373,7 +772,8 @@ class SQLInjectionDetector:
         injection_type: SQLInjectionType, 
         payload: str,
         encoding_type: Optional[EncodingType],
-        decode_depth: int
+        decode_depth: int,
+        decode_path: List[EncodingType]
     ) -> float:
         base_confidence = {
             SQLInjectionType.UNION_BASED: 0.9,
@@ -397,6 +797,8 @@ class SQLInjectionDetector:
             ('SLEEP', 0.25),
             ('EXTRACTVALUE', 0.2),
             ('UPDATEXML', 0.2),
+            ('DROP', 0.2),
+            ('DELETE', 0.15),
         ]
 
         for indicator, weight in indicators:
@@ -405,19 +807,31 @@ class SQLInjectionDetector:
 
         if encoding_type is not None:
             encoding_bonus = {
-                EncodingType.DOUBLE_URL_ENCODED: 0.15,
-                EncodingType.TRIPLE_URL_ENCODED: 0.2,
-                EncodingType.UNICODE_URL_ENCODED: 0.15,
-                EncodingType.BASE64_ENCODED: 0.1,
+                EncodingType.TRIPLE_URL_ENCODED: 0.25,
+                EncodingType.DOUBLE_URL_ENCODED: 0.2,
+                EncodingType.DOUBLE_HTML_ENTITY: 0.2,
+                EncodingType.UNICODE_URL: 0.2,
+                EncodingType.BASE64_ENCODED: 0.15,
+                EncodingType.HEX_STRING: 0.15,
+                EncodingType.MIXED_ENCODING: 0.2,
+                EncodingType.UNICODE_ESCAPE: 0.15,
+                EncodingType.URL_ENCODED: 0.1,
+                EncodingType.HTML_ENTITY: 0.1,
                 EncodingType.HEX_ENCODED: 0.1,
-                EncodingType.URL_ENCODED: 0.05,
-                EncodingType.HTML_ENTITY: 0.05,
-                EncodingType.UNICODE_ESCAPE: 0.1,
+                EncodingType.URL_PLUS_ENCODED: 0.1,
             }.get(encoding_type, 0.05)
             base_confidence = min(1.0, base_confidence + encoding_bonus)
 
+        if decode_path:
+            path_bonus = 0.0
+            for enc in decode_path:
+                if enc in [EncodingType.DOUBLE_URL_ENCODED, EncodingType.TRIPLE_URL_ENCODED, 
+                          EncodingType.DOUBLE_HTML_ENTITY, EncodingType.MIXED_ENCODING]:
+                    path_bonus += 0.1
+            base_confidence = min(1.0, base_confidence + path_bonus)
+
         if decode_depth > 1:
-            depth_bonus = min(0.15, decode_depth * 0.05)
+            depth_bonus = min(0.2, decode_depth * 0.04)
             base_confidence = min(1.0, base_confidence + depth_bonus)
 
         return round(base_confidence, 2)
@@ -430,7 +844,7 @@ class SQLInjectionDetector:
                 payload.payload.lower(), 
                 payload.injection_type, 
                 payload.location,
-                payload.encoding_type
+                tuple(payload.decode_path) if payload.decode_path else None
             )
             
             if key not in seen:
@@ -439,8 +853,19 @@ class SQLInjectionDetector:
                 existing = seen[key]
                 if payload.confidence > existing.confidence:
                     seen[key] = payload
+                elif payload.confidence == existing.confidence:
+                    if len(payload.decode_path) > len(existing.decode_path):
+                        seen[key] = payload
         
-        return list(seen.values())
+        unique_payloads = list(seen.values())
+        
+        unique_payloads.sort(key=lambda x: (
+            -x.confidence,
+            -len(x.decode_path),
+            x.decode_depth
+        ))
+        
+        return unique_payloads
 
     def analyze_http_session(self, session: Dict[str, Any]) -> Optional[VulnerabilityFinding]:
         payloads = []
@@ -508,7 +933,8 @@ def finding_to_dict(finding: VulnerabilityFinding) -> Dict[str, Any]:
                 'context': p.context,
                 'original_encoded': p.original_encoded,
                 'encoding_type': p.encoding_type.value if p.encoding_type else None,
-                'decode_depth': p.decode_depth
+                'decode_depth': p.decode_depth,
+                'decode_path': [enc.value for enc in p.decode_path] if p.decode_path else []
             } for p in finding.payloads
         ],
         'request_raw': finding.request_raw,
@@ -517,92 +943,110 @@ def finding_to_dict(finding: VulnerabilityFinding) -> Dict[str, Any]:
         'severity': 'HIGH' if any(p.confidence > 0.8 for p in finding.payloads) else 'MEDIUM'
     }
 
-class TestEncodingDecoder:
+class TestAdvancedDecoder:
     @staticmethod
-    def test_url_decode():
-        decoder = EncodingDecoder()
+    def test_all_encodings():
+        decoder = AdvancedDecoder()
+        detector = SQLInjectionDetector(enable_encoding_detection=True)
         
-        encoded = "id=1%27%20UNION%20SELECT%201,2,3--"
-        decoded_list = decoder.decode_all(encoded)
+        test_cases = [
+            ("id=1' UNION SELECT 1,2,3--", "Plain Text", None),
+            ("id=1%27%20UNION%20SELECT%201,2,3--", "URL Encoded", EncodingType.URL_ENCODED),
+            ("id=1%2527%2520UNION%2520SELECT%25201,2,3--", "Double URL Encoded", EncodingType.DOUBLE_URL_ENCODED),
+            ("id=1%252527%252520UNION%252520SELECT%2525201,2,3--", "Triple URL Encoded", EncodingType.TRIPLE_URL_ENCODED),
+            ("id=1&#39; UNION SELECT 1,2,3--", "HTML Entity", EncodingType.HTML_ENTITY),
+            ("id=1&amp;#39; UNION SELECT 1,2,3--", "Double HTML Entity", EncodingType.DOUBLE_HTML_ENTITY),
+            ("id=1\\u0027 UNION SELECT 1,2,3--", "Unicode Escape", EncodingType.UNICODE_ESCAPE),
+            ("id=1%u0027 UNION SELECT 1,2,3--", "Unicode URL", EncodingType.UNICODE_URL),
+            ("id=1\\x27 UNION SELECT 1,2,3--", "Hex Escape", EncodingType.HEX_ENCODED),
+            ("id=1'+UNION+SELECT+1,2,3--", "URL+ Encoded", EncodingType.URL_PLUS_ENCODED),
+        ]
         
-        found_sql_injection = False
-        for decoded, encoding, depth in decoded_list:
-            if 'UNION SELECT' in decoded.upper():
-                found_sql_injection = True
-                break
+        print("=" * 80)
+        print("Testing Advanced Encoding Decoder")
+        print("=" * 80)
         
-        return found_sql_injection
-
+        all_passed = True
+        for payload, description, expected_encoding in test_cases:
+            print(f"\n{description}:")
+            print(f"  Input: {payload[:80]}...")
+            
+            decoded = decoder.decode_all(payload)
+            print(f"  Decoded variants: {len(decoded)}")
+            
+            results = detector.detect(payload, "URI")
+            
+            found_sql = False
+            for r in results:
+                if 'UNION' in r.payload.upper() or 'SELECT' in r.payload.upper():
+                    found_sql = True
+                    enc_type = r.encoding_type.value if r.encoding_type else "None"
+                    print(f"    [OK] Detected: {r.payload[:40]}... (conf: {r.confidence}, encoding: {enc_type}, depth: {r.decode_depth})")
+                    if r.decode_path:
+                        print(f"          Decode path: {' -> '.join([e.value for e in r.decode_path])}")
+            
+            if not found_sql:
+                print(f"    [FAIL] SQL injection not detected!")
+                all_passed = False
+        
+        print("\n" + "=" * 80)
+        print(f"Overall: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
+        print("=" * 80)
+        
+        return all_passed
+    
     @staticmethod
-    def test_double_url_decode():
-        decoder = EncodingDecoder()
+    def test_mixed_encodings():
+        decoder = AdvancedDecoder()
+        detector = SQLInjectionDetector(enable_encoding_detection=True)
         
-        double_encoded = "id=1%2527%2520UNION%2520SELECT%25201,2,3--"
-        decoded_list = decoder.decode_all(double_encoded)
+        mixed_test_cases = [
+            ("id=1%2527%2520AND%2520SLEEP%25285%2529--", "Double URL + Sleep"),
+            ("id=1&#39;%20UNION%20SELECT%201,2,3--", "HTML Entity + URL"),
+            ("id=1%2526%252339%253B%2520UNION%2520SELECT", "Double URL + Double HTML Entity"),
+            ("id=1%u0027%20AND%201=1--", "Unicode URL + URL"),
+        ]
         
-        found_sql_injection = False
-        for decoded, encoding, depth in decoded_list:
-            if 'UNION SELECT' in decoded.upper():
-                found_sql_injection = True
-                break
+        print("\n" + "=" * 80)
+        print("Testing Mixed Encodings")
+        print("=" * 80)
         
-        return found_sql_injection
-
-    @staticmethod
-    def test_html_entity_decode():
-        decoder = EncodingDecoder()
+        all_passed = True
+        for payload, description in mixed_test_cases:
+            print(f"\n{description}:")
+            print(f"  Input: {payload[:80]}...")
+            
+            decoded = decoder.decode_all(payload)
+            print(f"  Decoded variants: {len(decoded)}")
+            
+            results = detector.detect(payload, "URI")
+            
+            found = False
+            for r in results:
+                if 'UNION' in r.payload.upper() or 'SLEEP' in r.payload.upper() or 'AND' in r.payload.upper():
+                    found = True
+                    enc_type = r.encoding_type.value if r.encoding_type else "None"
+                    print(f"    [OK] Detected: {r.payload[:40]}... (conf: {r.confidence}, encoding: {enc_type}, depth: {r.decode_depth})")
+                    if r.decode_path:
+                        print(f"          Decode path: {' -> '.join([e.value for e in r.decode_path])}")
+            
+            if not found:
+                print(f"    [FAIL] Attack not detected!")
+                all_passed = False
         
-        html_encoded = "id=1&#39; UNION SELECT 1,2,3--"
-        decoded_list = decoder.decode_all(html_encoded)
-        
-        found_sql_injection = False
-        for decoded, encoding, depth in decoded_list:
-            if 'UNION SELECT' in decoded.upper():
-                found_sql_injection = True
-                break
-        
-        return found_sql_injection
-
-    @staticmethod
-    def test_unicode_escape():
-        decoder = EncodingDecoder()
-        
-        unicode_encoded = r"id=1\u0027 UNION SELECT 1,2,3--"
-        decoded_list = decoder.decode_all(unicode_encoded)
-        
-        found_sql_injection = False
-        for decoded, encoding, depth in decoded_list:
-            if 'UNION SELECT' in decoded.upper():
-                found_sql_injection = True
-                break
-        
-        return found_sql_injection
+        return all_passed
 
 if __name__ == "__main__":
-    print("Testing Encoding Decoder...")
+    print("=" * 80)
+    print("Advanced Encoding Decoder Test Suite")
+    print("=" * 80)
     
-    print(f"URL Decode Test: {TestEncodingDecoder.test_url_decode()}")
-    print(f"Double URL Decode Test: {TestEncodingDecoder.test_double_url_decode()}")
-    print(f"HTML Entity Decode Test: {TestEncodingDecoder.test_html_entity_decode()}")
-    print(f"Unicode Escape Test: {TestEncodingDecoder.test_unicode_escape()}")
+    result1 = TestAdvancedDecoder.test_all_encodings()
+    result2 = TestAdvancedDecoder.test_mixed_encodings()
     
-    print("\nTesting SQL Injection Detection with Encoded Payloads...")
-    
-    detector = SQLInjectionDetector(enable_encoding_detection=True)
-    
-    test_cases = [
-        ("id=1' UNION SELECT 1,2,3--", "Plain SQL Injection"),
-        ("id=1%27%20UNION%20SELECT%201,2,3--", "URL Encoded"),
-        ("id=1%2527%2520UNION%2520SELECT%25201,2,3--", "Double URL Encoded"),
-        ("id=1&#39; UNION SELECT 1,2,3--", "HTML Entity Encoded"),
-        ("id=1%252527%252520UNION%252520SELECT", "Triple URL Encoded"),
-    ]
-    
-    for payload, description in test_cases:
-        results = detector.detect(payload, "URI")
-        print(f"\n{description}:")
-        print(f"  Payload: {payload[:60]}...")
-        print(f"  Detected payloads: {len(results)}")
-        for r in results:
-            enc_type = r.encoding_type.value if r.encoding_type else "None"
-            print(f"    - {r.injection_type.value}: '{r.payload[:30]}...' (conf: {r.confidence}, encoding: {enc_type}, depth: {r.decode_depth})")
+    print("\n" + "=" * 80)
+    if result1 and result2:
+        print("FINAL RESULT: ALL TESTS PASSED [OK]")
+    else:
+        print("FINAL RESULT: SOME TESTS FAILED [FAIL]")
+    print("=" * 80)
